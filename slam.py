@@ -70,19 +70,24 @@ class SLAM:
         self.gaussians.training_setup(opt_params)
         bg_color = [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
+        
+        # 💡 [리뷰 포인트 - 병렬 처리]: Frontend(카메라 트래킹)와 Backend(맵/가우시안 최적화) 간의 
+        # 데이터를 주고받기 위한 멀티프로세싱 큐(Queue) 생성. 매우 적절한 설계입니다.
         frontend_queue = mp.Queue()
         backend_queue = mp.Queue()
 
+        # GUI 사용 여부에 따라 실제 큐 또는 Dummy 큐(FakeQueue)를 할당하여 분기문 최소화 (좋은 패턴)
         q_main2vis = mp.Queue() if self.use_gui else FakeQueue()
         q_vis2main = mp.Queue() if self.use_gui else FakeQueue()
 
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
+        # 트래킹과 맵핑을 담당할 객체 생성
         self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
-
+        
+        # Frontend 초기화 및 통신 큐 연결
         self.frontend.dataset = self.dataset
         self.frontend.background = self.background
         self.frontend.pipeline_params = self.pipeline_params
@@ -92,9 +97,10 @@ class SLAM:
         self.frontend.q_vis2main = q_vis2main
         self.frontend.set_hyperparams()
 
+        # Backend 초기화 및 통신 큐 연결
         self.backend.gaussians = self.gaussians
         self.backend.background = self.background
-        self.backend.cameras_extent = 6.0
+        self.backend.cameras_extent = 6.0   # 💡 [리뷰 포인트]: extent 값 6.0도 씬(scene)의 크기에 따라 달라지므로 하드코딩을 피하는 것이 좋습니다.
         self.backend.pipeline_params = self.pipeline_params
         self.backend.opt_params = self.opt_params
         self.backend.frontend_queue = frontend_queue
@@ -103,6 +109,7 @@ class SLAM:
 
         self.backend.set_hyperparams()
 
+        # GUI 파라미터 래퍼 객체 생성
         self.params_gui = gui_utils.ParamsGUI(
             pipe=self.pipeline_params,
             background=self.background,
@@ -111,27 +118,42 @@ class SLAM:
             q_vis2main=q_vis2main,
         )
 
+        # 💡 [리뷰 포인트 - 프로세스 실행]: Backend를 별도의 백그라운드 프로세스로 실행합니다.
         backend_process = mp.Process(target=self.backend.run)
         if self.use_gui:
+            # GUI 프로세스도 병렬로 실행
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
             gui_process.start()
-            time.sleep(5)
+            time.sleep(5)       # GUI가 초기화될 시간을 벌어줌 (조금 투박하지만 간단한 방법)
 
+        # Backend 프로세스 시작
         backend_process.start()
+        # 💡 [리뷰 포인트 - 블로킹 호출]: Frontend는 메인 프로세스에서 그대로 실행됩니다.
+        # self.frontend.run()이 끝날 때까지 (데이터셋을 다 돌 때까지) 메인 스레드는 여기서 블로킹됩니다.
         self.frontend.run()
+
+        # 트래킹이 끝나면 Backend 최적화를 일시정지 시킴
         backend_queue.put(["pause"])
 
+        # 전체 실행 시간 기록 완료
         end.record()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()# CUDA 연산이 끝날 때까지 대기
+        
+        # FPS 계산
         # empty the frontend queue
         N_frames = len(self.frontend.cameras)
         FPS = N_frames / (start.elapsed_time(end) * 0.001)
         Log("Total time", start.elapsed_time(end) * 0.001, tag="Eval")
         Log("Total FPS", N_frames / (start.elapsed_time(end) * 0.001), tag="Eval")
 
+        # ==========================================================
+        # 아래부터는 평가(Evaluation) 및 렌더링 품질 측정 로직입니다.
+        # ==========================================================
         if self.eval_rendering:
             self.gaussians = self.frontend.gaussians
             kf_indices = self.frontend.kf_indices
+
+            # 1. ATE (Absolute Trajectory Error) - 카메라 포즈 추정 오차 측정
             ATE = eval_ate(
                 self.frontend.cameras,
                 self.frontend.kf_indices,
@@ -141,6 +163,7 @@ class SLAM:
                 monocular=self.monocular,
             )
 
+            # 2. 색상 최적화 전 렌더링 품질 측정 (PSNR, SSIM, LPIPS)
             rendering_result = eval_rendering(
                 self.frontend.cameras,
                 self.gaussians,
@@ -162,9 +185,13 @@ class SLAM:
                 FPS,
             )
 
+            # 💡 [리뷰 포인트 - 큐 비우기]: 통신용 큐를 재활용하기 위해 비우는 과정.
+            # 데드락(Deadlock)을 방지하기 위한 중요한 처리가 들어갔습니다.
             # re-used the frontend queue to retrive the gaussians from the backend.
             while not frontend_queue.empty():
                 frontend_queue.get()
+
+            # Backend에 "color_refinement"(색상 추가 미세조정) 명령을 내림
             backend_queue.put(["color_refinement"])
             while True:
                 if frontend_queue.empty():
@@ -176,6 +203,7 @@ class SLAM:
                     self.gaussians = gaussians
                     break
 
+            # 3. 색상 최적화 후 렌더링 품질 재측정
             rendering_result = eval_rendering(
                 self.frontend.cameras,
                 self.gaussians,
@@ -194,9 +222,11 @@ class SLAM:
                 ATE,
                 FPS,
             )
+            # 최종 결과 WandB 로깅 및 파일 저장
             wandb.log({"Metrics": metrics_table})
             save_gaussians(self.gaussians, self.save_dir, "final_after_opt", final=True)
 
+        # 시스템 종료 로직: Backend 프로세스 정상 종료 대기
         backend_queue.put(["stop"])
         backend_process.join()
         Log("Backend stopped and joined the main thread")

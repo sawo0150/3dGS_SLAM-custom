@@ -15,23 +15,32 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 
 
+# 이 코드는 SLAM 시스템의 눈과 발 역할을 하는 Frontend (트래킹 및 키프레임 관리) 부분을 담당
+# 카메라가 실시간으로 어디로 이동하고 있는지(Pose Tracking) 계산하고, 
+# 언제 맵을 업데이트할지(Keyframe Selection) 결정하는 아주 핵심적인 모듈입니다.
+
+# 💡 [리뷰 포인트 - 프로세스 분리]: 
+# FrontEnd 클래스 자체가 mp.Process를 상속받아 독립된 프로세스로 동작하도록 설계되었습니다.
+# 카메라 추적(Tracking)이 렌더링/최적화(Mapping) 때문에 끊기지 않도록 하는 훌륭한 패턴입니다.
 class FrontEnd(mp.Process):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.background = None
         self.pipeline_params = None
-        self.frontend_queue = None
-        self.backend_queue = None
-        self.q_main2vis = None
-        self.q_vis2main = None
+
+        # 프로세스 간 통신(IPC)을 위한 큐
+        self.frontend_queue = None  # Backend -> Frontend (맵 업데이트 정보 등)
+        self.backend_queue = None   # Frontend -> Backend (새 키프레임, 트래킹 정보 등)
+        self.q_main2vis = None      # Frontend -> GUI
+        self.q_vis2main = None      # GUI -> Frontend
 
         self.initialized = False
         self.kf_indices = []
-        self.monocular = config["Training"]["monocular"]
+        self.monocular = config["Training"]["monocular"]     # 단일 카메라(RGB) 모드인지 여부
         self.iteration_count = 0
         self.occ_aware_visibility = {}
-        self.current_window = []
+        self.current_window = []        # 현재 최적화에 사용할 키프레임들의 슬라이딩 윈도우
 
         self.reset = True
         self.requested_init = False
@@ -44,6 +53,7 @@ class FrontEnd(mp.Process):
         self.pause = False
 
     def set_hyperparams(self):
+        # ... (설정값 불러오기 생략) ...
         self.save_dir = self.config["Results"]["save_dir"]
         self.save_results = self.config["Results"]["save_results"]
         self.save_trj = self.config["Results"]["save_trj"]
@@ -55,6 +65,10 @@ class FrontEnd(mp.Process):
         self.single_thread = self.config["Training"]["single_thread"]
 
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
+        # 💡 [리뷰 포인트 - 단안(Monocular) 깊이 추정]: 
+        # RGB-D 카메라가 아닌 단일 RGB 카메라일 경우, 깊이(Depth) 센서 값이 없으므로 
+        # 처음에는 임의의 깊이값(2.0 + 노이즈)으로 초기화하거나, 기존 가우시안 렌더링 결과의 
+        # 중앙값(Median depth)을 활용해 초기 깊이를 추정(Guessing)하는 매우 흥미로운 로직입니다.
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
         self.kf_indices.append(cur_frame_idx)
         viewpoint = self.cameras[cur_frame_idx]
@@ -62,12 +76,16 @@ class FrontEnd(mp.Process):
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
         if self.monocular:
             if depth is None:
+                # 초기화 단계: 임의의 뎁스 생성 (2.0 근처)
                 initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2])
                 initial_depth += torch.randn_like(initial_depth) * 0.3
             else:
+                # 트래킹 중: 렌더링된 뎁스의 중앙값과 표준편차를 기반으로 아웃라이어를 걸러냄
                 depth = depth.detach().clone()
                 opacity = opacity.detach()
                 use_inv_depth = False
+
+                # ... (역심도(Inverse Depth) 또는 일반 심도 기반 아웃라이어 제거 로직) ...
                 if use_inv_depth:
                     inv_depth = 1.0 / depth
                     inv_median_depth, inv_std, valid_mask = get_median_depth(
@@ -100,24 +118,30 @@ class FrontEnd(mp.Process):
                         invalid_depth_mask, std * 0.5, std * 0.2
                     )
 
+                # 유효하지 않은 RGB 픽셀은 뎁스 무시
                 initial_depth[~valid_rgb] = 0  # Ignore the invalid rgb pixels
             return initial_depth.cpu().numpy()[0]
         # use the observed depth
+        # RGB-D 모드: 실제 센서에서 관측된 뎁스를 그대로 사용
         initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)
         initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
         return initial_depth[0].numpy()
 
     def initialize(self, cur_frame_idx, viewpoint):
+        # 첫 번째 프레임을 시스템에 등록하고 초기화하는 함수
         self.initialized = not self.monocular
         self.kf_indices = []
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.current_window = []
         # remove everything from the queues
+        # 큐 초기화 (이전 잔여물 제거)
         while not self.backend_queue.empty():
             self.backend_queue.get()
 
         # Initialise the frame at the ground truth pose
+        # 💡 [리뷰 포인트]: 첫 프레임은 원점(또는 Ground Truth)으로 고정하여 좌표계의 기준을 잡습니다.
+        viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
         viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
 
         self.kf_indices = []
@@ -126,9 +150,13 @@ class FrontEnd(mp.Process):
         self.reset = False
 
     def tracking(self, cur_frame_idx, viewpoint):
+        # 💡 [리뷰 포인트 - Photometric Tracking]: 
+        # 카메라의 현재 위치를 찾기 위해, 직전 프레임 위치에서 시작하여(prev.R, prev.T)
+        # 렌더링 이미지와 실제 들어온 이미지를 비교(loss_tracking)하며 카메라 포즈를 미세 조정합니다.
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         viewpoint.update_RT(prev.R, prev.T)
 
+        # 최적화할 대상: 카메라의 회전(Rot), 이동(Trans), 그리고 노출값(Exposure a, b)
         opt_params = []
         opt_params.append(
             {
@@ -160,7 +188,10 @@ class FrontEnd(mp.Process):
         )
 
         pose_optimizer = torch.optim.Adam(opt_params)
+
+        # tracking_itr_num (예: 100회) 만큼 반복하면서 포즈를 최적화
         for tracking_itr in range(self.tracking_itr_num):
+            # 현재 추정된 위치에서 3D 씬(가우시안)을 렌더링
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )
@@ -170,6 +201,7 @@ class FrontEnd(mp.Process):
                 render_pkg["opacity"],
             )
             pose_optimizer.zero_grad()
+            # 실제 카메라 이미지와 렌더링 이미지 간의 차이(Loss) 계산
             loss_tracking = get_loss_tracking(
                 self.config, image, depth, opacity, viewpoint
             )
@@ -178,7 +210,8 @@ class FrontEnd(mp.Process):
             with torch.no_grad():
                 pose_optimizer.step()
                 converged = update_pose(viewpoint)
-
+            
+            # 10번 반복마다 GUI로 현재 상태 전송하여 시각화
             if tracking_itr % 10 == 0:
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
@@ -190,7 +223,7 @@ class FrontEnd(mp.Process):
                     )
                 )
             if converged:
-                break
+                break   # 로스가 수렴하면 조기 종료
 
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg
@@ -202,6 +235,10 @@ class FrontEnd(mp.Process):
         cur_frame_visibility_filter,
         occ_aware_visibility,
     ):
+        # 💡 [리뷰 포인트 - 키프레임 등록 조건]: 
+        # 카메라가 직전 키프레임 대비 얼마나 이동했는지(dist), 
+        # 그리고 바라보는 뷰가 얼마나 겹치는지(point_ratio_2)를 계산하여 새 키프레임 여부를 결정합니다.
+        # 시각적 SLAM에서 매우 교과서적이고 안정적인 접근법입니다.
         kf_translation = self.config["Training"]["kf_translation"]
         kf_min_translation = self.config["Training"]["kf_min_translation"]
         kf_overlap = self.config["Training"]["kf_overlap"]
@@ -227,6 +264,8 @@ class FrontEnd(mp.Process):
     def add_to_window(
         self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
     ):
+        # 로컬 매핑을 위한 슬라이딩 윈도우 관리 함수
+        # 윈도우 사이즈가 초과되면, 시야가 너무 안 겹치거나 공간상 가장 덜 중요한(중복되는) 키프레임을 버림
         N_dont_touch = 2
         window = [cur_frame_idx] + window
         # remove frames which has little overlap with the current frame
