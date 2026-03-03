@@ -24,6 +24,12 @@ from utils.slam_frontend import FrontEnd
 
 class SLAM:
     def __init__(self, config, save_dir=None):
+        # 💡 [리뷰 포인트 - 아키텍처]: 현재 클래스의 __init__ 메서드 안에 초기화 로직뿐만 아니라
+        # 실제 시스템을 실행하고(start), 평가하고(eval), 종료하는(join) 모든 생명주기 로직이 들어있습니다.
+        # 객체 지향 설계 관점에서는 __init__에서는 큐와 프로세스 초기화만 진행하고, 
+        # 실제 실행 흐름은 아래에 비어있는 run() 메서드로 분리하는 것이 유지보수에 훨씬 좋습니다.
+
+        # CUDA 비동기 연산의 정확한 시간 측정을 위해 Event 객체 생성
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -31,6 +37,8 @@ class SLAM:
 
         self.config = config
         self.save_dir = save_dir
+        
+        # munchify를 사용해 딕셔너리 키를 객체 속성처럼 접근할 수 있게 변환 (예: dict["key"] -> dict.key)
         model_params = munchify(config["model_params"])
         opt_params = munchify(config["opt_params"])
         pipeline_params = munchify(config["pipeline_params"])
@@ -40,6 +48,7 @@ class SLAM:
             pipeline_params,
         )
 
+        # 설정값 로드 (라이브 모드 여부, 단일 카메라 여부, 구면 조화 함수(SH) 사용 여부 등)
         self.live_mode = self.config["Dataset"]["type"] == "realsense"
         self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
         self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
@@ -48,10 +57,12 @@ class SLAM:
             self.use_gui = True
         self.eval_rendering = self.config["Results"]["eval_rendering"]
 
+        # SH 차수 설정 (사용하면 3, 아니면 0)
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
 
+        # 핵심 3D 표현인 Gaussian 모델 초기화
         self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
-        self.gaussians.init_lr(6.0)
+        self.gaussians.init_lr(6.0)     # 💡 [리뷰 포인트]: 학습률 6.0은 하드코딩되어 있는데, config 파일로 빼는 것이 유연성에 좋습니다.
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
@@ -206,14 +217,18 @@ if __name__ == "__main__":
 
     args = parser.parse_args(sys.argv[1:])
 
+    # 💡 [리뷰 포인트]: PyTorch + 멀티프로세싱을 사용할 때 CUDA 컨텍스트 공유 문제를 
+    # 해결하기 위해 'spawn' 방식을 강제하는 매우 중요한 설정입니다.
     mp.set_start_method("spawn")
 
+    # 설정 파일 파싱 (YAML)
     with open(args.config, "r") as yml:
         config = yaml.safe_load(yml)
 
     config = load_config(args.config)
     save_dir = None
 
+    # 평가 모드일 경우 강제로 덮어쓰는 설정들
     if args.eval:
         Log("Running MonoGS in Evaluation Mode")
         Log("Following config will be overriden")
@@ -226,6 +241,7 @@ if __name__ == "__main__":
         Log("\tuse_wandb=True")
         config["Results"]["use_wandb"] = True
 
+    # 결과 저장을 위한 디렉토리 구조 생성 (날짜/시간 기반 고유 폴더)
     if config["Results"]["save_results"]:
         mkdir_p(config["Results"]["save_dir"])
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
@@ -237,9 +253,13 @@ if __name__ == "__main__":
         tmp = tmp.split(".")[0]
         config["Results"]["save_dir"] = save_dir
         mkdir_p(save_dir)
+
+        # 재현성을 위해 현재 사용된 config를 결과 폴더에 백업
         with open(os.path.join(save_dir, "config.yml"), "w") as file:
             documents = yaml.dump(config, file)
         Log("saving results in " + save_dir)
+
+        # WandB (Weights & Biases) 초기화: 실험 추적용
         run = wandb.init(
             project="MonoGS",
             name=f"{tmp}_{current_datetime}",
@@ -249,9 +269,13 @@ if __name__ == "__main__":
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
 
+    # SLAM 객체 생성 (현재 구조상 생성과 동시에 전체 파이프라인이 끝까지 실행됨)
     slam = SLAM(config, save_dir=save_dir)
 
+    # 아무것도 하지 않는 껍데기 메서드 호출
     slam.run()
+
+    # WandB 세션 종료
     wandb.finish()
 
     # All done
