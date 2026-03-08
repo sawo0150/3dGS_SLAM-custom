@@ -49,7 +49,7 @@ class SLAM:
         )
 
         # 설정값 로드 (라이브 모드 여부, 단일 카메라 여부, 구면 조화 함수(SH) 사용 여부 등)
-        self.live_mode = self.config["Dataset"]["type"] == "realsense"
+        self.live_mode = self.config["Dataset"]["type"] == ["realsense", "zmq"]
         self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
         self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
         self.use_gui = self.config["Results"]["use_gui"]

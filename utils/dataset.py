@@ -1,3 +1,4 @@
+# utils/dataset.py
 import csv
 import glob
 import os
@@ -9,6 +10,7 @@ import trimesh
 from PIL import Image
 
 from gaussian_splatting.utils.graphics_utils import focal2fov
+# from utils.dataset_zmq import ZmqDataset
 
 try:
     import pyrealsense2 as rs
@@ -528,5 +530,8 @@ def load_dataset(args, path, config):
         return EurocDataset(args, path, config)
     elif config["Dataset"]["type"] == "realsense":
         return RealsenseDataset(args, path, config)
+    elif config["Dataset"]["type"] == "zmq":
+        from utils.dataset_zmq import ZmqDataset  # <-- 여기로 임포트 위치를 옮김!
+        return ZmqDataset(args, path, config)
     else:
         raise ValueError("Unknown dataset type")
