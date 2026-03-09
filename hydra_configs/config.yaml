@@ -1,0 +1,9 @@
+defaults:
+  - _self_
+  - dataset: tum_fr3  # 기본 데이터셋 설정 파일 지정
+  - model: mono_gs   # 기본 모델 설정 파일 지정
+
+# 공통 실행 옵션
+verbose: True
+output_path: "output/${dataset.name}"
+save_ckpt: True
