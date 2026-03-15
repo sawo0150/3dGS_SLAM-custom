@@ -1,4 +1,5 @@
 # utils/dataset_zmq.py
+
 import queue
 import threading
 import time
@@ -39,20 +40,14 @@ class ZmqDataset(BaseDataset):
         self.frames_emitted = 0
 
         self.frame_queue = queue.Queue(maxsize=int(ds_cfg.get("queue_size", 8)))
-        self.pending_frames = {}   # seq -> (recv_time, frame_msg)
-        self.pending_odom = {}     # seq -> 4x4 pose
-        self.last_pose = np.eye(4, dtype=np.float32)
-        self.odom_wait_ms = float(ds_cfg.get("odom_wait_ms", 10.0))
+        # MonoGS 내부에는 world-to-camera(T_cw)를 넣는 것이 안전함
+        self.last_pose_w2c = np.eye(4, dtype=np.float32)
 
         self.ctx = zmq.Context.instance()
 
-        self.frame_sock = self.ctx.socket(zmq.SUB)
-        self.frame_sock.connect(ds_cfg["frame_endpoint"])
-        self.frame_sock.setsockopt(zmq.SUBSCRIBE, b"")
-
-        self.odom_sock = self.ctx.socket(zmq.SUB)
-        self.odom_sock.connect(ds_cfg["odom_endpoint"])
-        self.odom_sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self.bundle_sock = self.ctx.socket(zmq.SUB)
+        self.bundle_sock.connect(ds_cfg["bundle_endpoint"])
+        self.bundle_sock.setsockopt(zmq.SUBSCRIBE, b"")
 
         self.ctrl_sock = None
         if "control_endpoint" in ds_cfg:
@@ -61,8 +56,8 @@ class ZmqDataset(BaseDataset):
             self.ctrl_sock.setsockopt(zmq.SUBSCRIBE, b"")
 
         self.poller = zmq.Poller()
-        self.poller.register(self.frame_sock, zmq.POLLIN)
-        self.poller.register(self.odom_sock, zmq.POLLIN)
+        self.poller.register(self.bundle_sock, zmq.POLLIN)
+
         if self.ctrl_sock is not None:
             self.poller.register(self.ctrl_sock, zmq.POLLIN)
 
@@ -79,26 +74,13 @@ class ZmqDataset(BaseDataset):
         self.frame_queue.put(item)
         self.frames_emitted += 1
 
-    def _emit_frame(self, frame_msg, pose_np):
+    def _emit_frame(self, frame_msg, pose_w2c_np):
         image = frame_msg.image
         if image is None:
             return
 
-        pose_np = np.asarray(pose_np, dtype=np.float32)
-        self._safe_put((frame_msg.seq, frame_msg.device_time_ns, image, pose_np))
-
-    def _flush_old_pending_frames(self):
-        now = time.monotonic()
-        old_seqs = []
-        for seq, (t0, frame_msg) in self.pending_frames.items():
-            age_ms = (now - t0) * 1000.0
-            if age_ms >= self.odom_wait_ms:
-                # matching odom이 너무 늦으면 latest pose 또는 identity로 진행
-                self._emit_frame(frame_msg, self.last_pose)
-                old_seqs.append(seq)
-
-        for seq in old_seqs:
-            self.pending_frames.pop(seq, None)
+        pose_w2c_np = np.asarray(pose_w2c_np, dtype=np.float32)
+        self._safe_put((frame_msg.seq, frame_msg.device_time_ns, image, pose_w2c_np))
 
     def _recv_loop(self):
         while True:
@@ -111,8 +93,8 @@ class ZmqDataset(BaseDataset):
                     self.num_imgs = self.frames_emitted
                     break
 
-            if self.frame_sock in events:
-                msg = self.frame_sock.recv_pyobj()
+            if self.bundle_sock in events:
+                msg = self.bundle_sock.recv_pyobj()
                 msg_type = type(msg).__name__
 
                 if msg_type == "ControlMsg" and msg.command in ("EOS", "STOP"):
@@ -120,39 +102,24 @@ class ZmqDataset(BaseDataset):
                     self.num_imgs = self.frames_emitted
                     break
 
-                if msg_type == "FrameMsg":
-                    if msg.seq in self.pending_odom:
-                        pose_np = self.pending_odom.pop(msg.seq)
-                        self.last_pose = pose_np
-                        self._emit_frame(msg, pose_np)
-                    else:
-                        self.pending_frames[msg.seq] = (time.monotonic(), msg)
+                if msg_type == "BundleMsg":
+                    frame_msg = msg.frame
+                    odom_msg = msg.odom
 
-            if self.odom_sock in events:
-                msg = self.odom_sock.recv_pyobj()
-                msg_type = type(msg).__name__
+                    if frame_msg is None:
+                        continue
 
-                if msg_type == "ControlMsg" and msg.command in ("EOS", "STOP"):
-                    self.closed = True
-                    self.num_imgs = self.frames_emitted
-                    break
+                    # 기본값: 마지막 pose 재사용
+                    pose_w2c = self.last_pose_w2c
 
-                if msg_type == "OdomMsg":
-                    pose_np = np.asarray(msg.T_world_device, dtype=np.float32)
-                    self.last_pose = pose_np
+                    # Aria/MPS 쪽 T_world_device는 보통 camera-to-world(T_wc) 해석이 자연스러움.
+                    # MonoGS dataset pose는 기존 parser들 기준으로 world-to-camera(T_cw) 쪽이므로 inverse해서 넣음.
+                    if odom_msg is not None and getattr(odom_msg, "T_world_device", None) is not None:
+                        T_wc = np.asarray(odom_msg.T_world_device, dtype=np.float32)
+                        pose_w2c = np.linalg.inv(T_wc)
+                        self.last_pose_w2c = pose_w2c
 
-                    if msg.seq in self.pending_frames:
-                        _, frame_msg = self.pending_frames.pop(msg.seq)
-                        self._emit_frame(frame_msg, pose_np)
-                    else:
-                        self.pending_odom[msg.seq] = pose_np
-
-            self._flush_old_pending_frames()
-
-        # 종료 직전 남은 frame은 마지막 pose로라도 배출
-        for _, frame_msg in list(self.pending_frames.values()):
-            self._emit_frame(frame_msg, self.last_pose)
-        self.pending_frames.clear()
+                    self._emit_frame(frame_msg, pose_w2c)
 
         self.num_imgs = self.frames_emitted
 

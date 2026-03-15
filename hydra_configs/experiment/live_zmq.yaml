@@ -1,6 +1,8 @@
+# hydra_configs/experiment/live_zmq.yaml
+
 defaults:
   - /dataset@_global_: live_zmq
-  - /results@_global_: live
+  - /results@_global_: live_wandb_online     # live or live_wandb_online
   - /training@_global_: mono_slam
   - /opt@_global_: default
   - /model@_global_: default

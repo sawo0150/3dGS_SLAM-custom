@@ -23,6 +23,9 @@ Training:
   rgb_boundary_threshold: 0.01
   single_thread: False
 
+  optimize_tracking_pose: false
+  optimize_keyframe_poses: false
+
   kf_translation: 0.05
   kf_min_translation: 0.02
   kf_overlap: 0.9

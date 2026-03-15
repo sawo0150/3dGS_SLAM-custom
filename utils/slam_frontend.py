@@ -1,3 +1,5 @@
+# utils/slam_frontend.py
+
 import time
 
 import numpy as np
@@ -38,6 +40,12 @@ class FrontEnd(mp.Process):
         self.initialized = False
         self.kf_indices = []
         self.monocular = config["Training"]["monocular"]     # 단일 카메라(RGB) 모드인지 여부
+
+        self.use_external_pose = bool(config["Dataset"].get("use_external_pose", False))
+        self.optimize_tracking_pose = bool(
+            config["Training"].get("optimize_tracking_pose", not self.use_external_pose)
+        )
+
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.current_window = []        # 현재 최적화에 사용할 키프레임들의 슬라이딩 윈도우
@@ -129,7 +137,7 @@ class FrontEnd(mp.Process):
 
     def initialize(self, cur_frame_idx, viewpoint):
         # 첫 번째 프레임을 시스템에 등록하고 초기화하는 함수
-        self.initialized = not self.monocular
+        self.initialized = self.use_external_pose or (not self.monocular)
         self.kf_indices = []
         self.iteration_count = 0
         self.occ_aware_visibility = {}
@@ -150,11 +158,28 @@ class FrontEnd(mp.Process):
         self.reset = False
 
     def tracking(self, cur_frame_idx, viewpoint):
+        # 외부 odom pose를 그대로 사용하는 모드:
+        # frontend에서는 pose estimation을 하지 않고, 들어온 pose를 현재 프레임 pose로 사용
+        if self.use_external_pose and not self.optimize_tracking_pose:
+            viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background
+            )
+            self.median_depth = get_median_depth(
+                render_pkg["depth"], render_pkg["opacity"]
+            )
+            return render_pkg
+
         # 💡 [리뷰 포인트 - Photometric Tracking]: 
         # 카메라의 현재 위치를 찾기 위해, 직전 프레임 위치에서 시작하여(prev.R, prev.T)
         # 렌더링 이미지와 실제 들어온 이미지를 비교(loss_tracking)하며 카메라 포즈를 미세 조정합니다.
-        prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-        viewpoint.update_RT(prev.R, prev.T)
+        if self.use_external_pose:
+            # external pose가 들어오지만 소량 refinement는 허용하는 모드
+            viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+        else:
+            prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+            viewpoint.update_RT(prev.R, prev.T)
 
         # 최적화할 대상: 카메라의 회전(Rot), 이동(Trans), 그리고 노출값(Exposure a, b)
         opt_params = []

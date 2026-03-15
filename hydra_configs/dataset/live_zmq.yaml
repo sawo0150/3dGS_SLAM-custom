@@ -10,11 +10,10 @@ Dataset:
   data_path: ""
 
   # ZMQ 관련
-  frame_endpoint: "tcp://127.0.0.1:5555"
-  odom_endpoint: "tcp://127.0.0.1:5557"
+  bundle_endpoint: tcp://127.0.0.1:5555
+  use_external_pose: true
   control_endpoint: "tcp://127.0.0.1:5559"
   queue_size: 8
-  odom_wait_ms: 10.0
 
   # MonoGS가 기대하는 키들
   pcd_downsample: 32

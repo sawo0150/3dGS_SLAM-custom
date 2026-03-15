@@ -3,6 +3,8 @@
 import os
 import sys
 import time
+import traceback
+import faulthandler
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from munch import munchify
 import wandb
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 
 # 기존 프로젝트 모듈 임포트
 from gaussian_splatting.scene.gaussian_model import GaussianModel
@@ -27,6 +30,35 @@ from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
 
+def _safe_qsize(q):
+    """
+    플랫폼/Queue 구현에 따라 qsize()가 안 되는 경우가 있어 안전하게 감쌉니다.
+    """
+    try:
+        return q.qsize()
+    except Exception as e:
+        return f"unavailable({type(e).__name__}: {e})"
+
+
+def _run_backend_debug(backend):
+    """
+    기능 변경 없이, child process 내부 예외 traceback을 확실히 보이게 하기 위한 래퍼.
+    """
+    try:
+        Log(
+            f"[BackEndDebug] child started | "
+            f"pid={os.getpid()} | ppid={os.getppid()}"
+        )
+        backend.run()
+        Log(f"[BackEndDebug] child exited normally | pid={os.getpid()}")
+    except Exception as e:
+        Log(
+            f"[BackEndDebug] child crashed | "
+            f"pid={os.getpid()} | exc={repr(e)}"
+        )
+        traceback.print_exc()
+        raise
+ 
 class SLAM:
     def __init__(self, config, save_dir=None):
         """
@@ -49,6 +81,7 @@ class SLAM:
         self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
         self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
         self.use_gui = self.config["Results"]["use_gui"]
+        self.use_wandb = self.config["Results"].get("use_wandb", False)
         if self.live_mode:
             self.use_gui = True
         self.eval_rendering = self.config["Results"]["eval_rendering"]
@@ -132,17 +165,52 @@ class SLAM:
         start_event.record()
 
         # 백그라운드 프로세스 시작
-        backend_process = mp.Process(target=self.backend.run)
+        backend_process = mp.Process(
+            target=_run_backend_debug,
+            args=(self.backend,),
+            name="BackEndProcess",
+        )
         if self.use_gui:
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
             gui_process.start()
             time.sleep(5)
         
         backend_process.start()
+        Log(
+            f"[MainDebug] backend process started | "
+            f"pid={backend_process.pid} | alive={backend_process.is_alive()} | "
+            f"exitcode={backend_process.exitcode}"
+        )
         
         # 메인 트래킹 루프 실행 (Frontend)
         Log("Frontend started")
-        self.frontend.run()
+        try:
+            self.frontend.run()
+            Log(
+                f"[MainDebug] frontend.run() returned normally | "
+                f"backend_alive={backend_process.is_alive()} | "
+                f"backend_pid={backend_process.pid} | "
+                f"backend_exitcode={backend_process.exitcode}"
+            )
+        except Exception as e:
+            Log(
+                f"[MainDebug] frontend.run() raised | "
+                f"exc={repr(e)}"
+            )
+            Log(
+                f"[MainDebug] backend status at failure | "
+                f"alive={backend_process.is_alive()} | "
+                f"pid={backend_process.pid} | "
+                f"exitcode={backend_process.exitcode}"
+            )
+            Log(
+                f"[MainDebug] queue state at failure | "
+                f"frontend_queue={_safe_qsize(self.frontend_queue)} | "
+                f"backend_queue={_safe_qsize(self.backend_queue)} | "
+                f"gui_queue={_safe_qsize(self.q_main2vis) if self.use_gui else 'disabled'}"
+            )
+            traceback.print_exc()
+            raise
 
         # 트래킹 종료 후 처리
         self.backend_queue.put(["pause"])
@@ -215,13 +283,31 @@ class SLAM:
 
 @hydra.main(version_base=None, config_path="hydra_configs", config_name="config")
 def main(cfg: DictConfig):
+    # low-level crash가 나도 stderr에 더 잘 남도록 함
+    faulthandler.enable()
+
     # 멀티프로세싱 스폰 방식 강제
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
 
+    Log(
+        f"[MainDebug] process started | "
+        f"pid={os.getpid()} | cwd={os.getcwd()}"
+    )
+    try:
+        Log(f"[MainDebug] mp start method = {mp.get_start_method(allow_none=True)}")
+    except Exception as e:
+        Log(f"[MainDebug] failed to query start method: {repr(e)}")
+    try:
+        Log(f"[MainDebug] mp sharing strategy = {mp.get_sharing_strategy()}")
+    except Exception as e:
+        Log(f"[MainDebug] failed to query sharing strategy: {repr(e)}")
+ 
     config = OmegaConf.to_container(cfg, resolve=True)
+    results_cfg = config["Results"]
+    hydra_output_dir = HydraConfig.get().runtime.output_dir
 
     # 평가 모드 동적 설정
     if cfg.get("eval", False):
@@ -232,6 +318,8 @@ def main(cfg: DictConfig):
             "eval_rendering": True,
             "use_wandb": True
         })
+        results_cfg = config["Results"]
+
 
     save_dir = None
     dataset_cfg = config.get("Dataset", {})
@@ -249,30 +337,59 @@ def main(cfg: DictConfig):
     if config["Results"]["save_results"]:
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        base_save_dir = config["Results"]["save_dir"]
+        base_save_dir = results_cfg["save_dir"]
         save_dir = os.path.join(base_save_dir, f"{scene_name}_{current_time}")
-        config["Results"]["save_dir"] = save_dir
+        results_cfg["save_dir"] = save_dir
         mkdir_p(save_dir)
 
         # Config 백업
         with open(os.path.join(save_dir, "config.yml"), "w") as f:
             yaml.dump(config, f)
 
-        # WandB 초기화
+    # WandB 초기화: save_results와 분리
+    if results_cfg.get("use_wandb", False):
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = results_cfg.get("wandb_name") or f"{scene_name}_{current_time}"
+
+        # 방식 A:
+        # wandb_dir가 비어 있으면 Hydra output dir 아래에 wandb 폴더 생성
+        wandb_dir = results_cfg.get("wandb_dir")
+        if not wandb_dir:
+            wandb_dir = os.path.join(hydra_output_dir, "wandb")
+        mkdir_p(wandb_dir)
+
+        # artifact 다운로드 경로를 따로 두고 싶을 때만 설정
+        wandb_artifact_dir = results_cfg.get("wandb_artifact_dir")
+        if wandb_artifact_dir:
+            mkdir_p(wandb_artifact_dir)
+            os.environ["WANDB_ARTIFACT_DIR"] = wandb_artifact_dir
+
+        Log(f"Hydra output dir: {hydra_output_dir}")
+        Log(f"W&B local dir: {wandb_dir}")
+
         wandb.init(
-            project=config.get("wandb_project", "MonoGS_Hydra"),
-            name=f"{scene_name}_{current_time}",
+            project=results_cfg.get("wandb_project", "MonoGS_Hydra"),
+            entity=results_cfg.get("wandb_entity", None),
+            name=run_name,
+            tags=results_cfg.get("wandb_tags", None),
+            notes=results_cfg.get("wandb_notes", None),
+
             config=config,
-            mode=None if config["Results"]["use_wandb"] else "disabled"
+            dir=wandb_dir,
+            mode=results_cfg.get("wandb_mode", "online"),
+
         )
         wandb.define_metric("frame_idx")
-        wandb.define_metric("ate*", step_metric="frame_idx")
+        wandb.define_metric("tracking/*", step_metric="frame_idx")
+        wandb.define_metric("mapping/*", step_metric="frame_idx")
+        wandb.define_metric("eval/*", step_metric="frame_idx")
+        wandb.define_metric("runtime/*")
 
     # SLAM 실행 (구조적 분리 완료)
     slam = SLAM(config, save_dir=save_dir)
     slam.run()
 
-    if config["Results"]["use_wandb"]:
+    if results_cfg.get("use_wandb", False):
         wandb.finish()
     Log("Done.")
 

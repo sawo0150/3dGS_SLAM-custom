@@ -1,7 +1,6 @@
 # hydra_configs/configs.yaml
 
 defaults:
-  - dataset: live_zmq
   - experiment: live_zmq
   - _self_
 
@@ -11,5 +10,6 @@ hydra:
   job:
     chdir: false
   run:
-    dir: .
+    # 실행 시 생성되는 로그와 출력물의 저장 경로 (실행 시간별로 폴더 생성)
+    dir: ../gsSLAM-outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
   output_subdir: null

@@ -1,3 +1,5 @@
+# utils/slam_backend.py
+
 import random
 import time
 
@@ -30,12 +32,17 @@ class BackEnd(mp.Process):
         self.device = "cuda"
         self.dtype = torch.float32
         self.monocular = config["Training"]["monocular"]
+        self.use_external_pose = bool(config["Dataset"].get("use_external_pose", False))
+        self.optimize_keyframe_poses = bool(
+            config["Training"].get("optimize_keyframe_poses", not self.use_external_pose)
+        )
         self.iteration_count = 0
         self.last_sent = 0
         self.occ_aware_visibility = {}
         self.viewpoints = {}
         self.current_window = []
         self.initialized = not self.monocular
+        self.initialized = self.use_external_pose or (not self.monocular)
         self.keyframe_optimizers = None
 
     def set_hyperparams(self):
@@ -74,7 +81,7 @@ class BackEnd(mp.Process):
         self.occ_aware_visibility = {}
         self.viewpoints = {}
         self.current_window = []
-        self.initialized = not self.monocular
+        self.initialized = self.use_external_pose or (not self.monocular)
         self.keyframe_optimizers = None
 
         # remove all gaussians
@@ -310,11 +317,12 @@ class BackEnd(mp.Process):
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
                 # Pose update
-                for cam_idx in range(min(frames_to_optimize, len(current_window))):
-                    viewpoint = viewpoint_stack[cam_idx]
-                    if viewpoint.uid == 0:
-                        continue
-                    update_pose(viewpoint)
+                if self.optimize_keyframe_poses:
+                    for cam_idx in range(min(frames_to_optimize, len(current_window))):
+                        viewpoint = viewpoint_stack[cam_idx]
+                        if viewpoint.uid == 0:
+                            continue
+                        update_pose(viewpoint)
         return gaussian_split
 
     def color_refinement(self):
@@ -435,7 +443,7 @@ class BackEnd(mp.Process):
                         if self.current_window[cam_idx] == 0:
                             continue
                         viewpoint = self.viewpoints[current_window[cam_idx]]
-                        if cam_idx < frames_to_optimize:
+                        if cam_idx < frames_to_optimize and self.optimize_keyframe_poses:
                             opt_params.append(
                                 {
                                     "params": [viewpoint.cam_rot_delta],
