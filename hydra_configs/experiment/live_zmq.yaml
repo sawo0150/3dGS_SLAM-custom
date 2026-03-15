@@ -1,0 +1,11 @@
+defaults:
+  - /dataset@_global_: live_zmq
+  - /results@_global_: live
+  - /training@_global_: mono_slam
+  - /opt@_global_: default
+  - /model@_global_: default
+  - /pipeline@_global_: default
+  - _self_
+
+experiment:
+  name: live_zmq

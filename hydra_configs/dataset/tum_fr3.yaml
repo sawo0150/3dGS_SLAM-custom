@@ -1,10 +1,26 @@
-name: "tum_fr3_office"
-type: "mono"
-data_path: "./datasets/tum/rgbd_dataset_freiburg3_office"
-camera:
-  w: 640
-  h: 480
-  fx: 535.4
-  fy: 539.2
-  cx: 320.1
-  cy: 247.6
+# hydra_configs/dataset/tum_fr3.yaml
+
+
+Dataset:
+  name: "tum_fr3_office"
+  type: "mono"
+  sensor_type: "monocular"
+
+  dataset_path: "./datasets/tum/rgbd_dataset_freiburg3_office"
+  data_path: "./datasets/tum/rgbd_dataset_freiburg3_office"
+
+  camera:
+    w: 640
+    h: 480
+    fx: 535.4
+    fy: 539.2
+    cx: 320.1
+    cy: 247.6
+
+  Calibration:
+    fx: 535.4
+    fy: 539.2
+    cx: 320.1
+    cy: 247.6
+    width: 640
+    height: 480

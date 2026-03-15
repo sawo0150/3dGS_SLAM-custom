@@ -1,0 +1,34 @@
+Training:
+  monocular: True
+  spherical_harmonics: False
+
+  init_itr_num: 1050
+  init_gaussian_update: 100
+  init_gaussian_reset: 500
+  init_gaussian_th: 0.005
+  init_gaussian_extent: 30
+  tracking_itr_num: 50
+  mapping_itr_num: 50
+
+  gaussian_update_every: 150
+  gaussian_update_offset: 50
+  gaussian_th: 0.7
+  gaussian_extent: 1.0
+  gaussian_reset: 2001
+  size_threshold: 20
+  kf_interval: 5
+  window_size: 8
+  pose_window: 3
+  edge_threshold: 1.1
+  rgb_boundary_threshold: 0.01
+  single_thread: False
+
+  kf_translation: 0.05
+  kf_min_translation: 0.02
+  kf_overlap: 0.9
+  kf_cutoff: 0.3
+  prune_mode: "slam"
+
+  lr:
+    cam_rot_delta: 0.003
+    cam_trans_delta: 0.001

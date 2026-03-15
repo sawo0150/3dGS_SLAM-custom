@@ -4,6 +4,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
@@ -58,7 +59,16 @@ class SLAM:
         
         # 💡 [개선]: 하드코딩된 학습률을 config에서 가져오도록 수정 가능 (현재는 기존 유지)
         self.gaussians.init_lr(6.0)
-        
+
+        dataset_cfg = self.config.get("Dataset", {})
+        dataset_path = (
+            dataset_cfg.get("dataset_path")
+            or dataset_cfg.get("data_path")
+            or model_params.source_path
+        )
+        if not getattr(model_params, "source_path", "") and dataset_path:
+            model_params.source_path = dataset_path
+    
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
@@ -72,7 +82,8 @@ class SLAM:
         self.q_main2vis = mp.Queue() if self.use_gui else FakeQueue()
         self.q_vis2main = mp.Queue() if self.use_gui else FakeQueue()
 
-        self.config["Results"]["save_dir"] = save_dir
+        if save_dir is not None:
+            self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
         # 모듈 생성 및 설정
@@ -223,13 +234,23 @@ def main(cfg: DictConfig):
         })
 
     save_dir = None
+    dataset_cfg = config.get("Dataset", {})
+    dataset_path = (
+        dataset_cfg.get("dataset_path")
+        or dataset_cfg.get("data_path")
+        or ""
+    )
+    scene_name = (
+        config.get("experiment", {}).get("name")
+        or dataset_cfg.get("name")
+        or (Path(dataset_path).name if dataset_path else dataset_cfg.get("type", "scene"))
+    )
+
     if config["Results"]["save_results"]:
-        # 경로 설정 최적화
-        dataset_path = config["Dataset"]["data_path"]
-        scene_name = dataset_path.rstrip("/").split("/")[-1]
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        save_dir = os.path.join(config["Results"]["save_dir"], f"{scene_name}_{current_time}")
+
+        base_save_dir = config["Results"]["save_dir"]
+        save_dir = os.path.join(base_save_dir, f"{scene_name}_{current_time}")
         config["Results"]["save_dir"] = save_dir
         mkdir_p(save_dir)
 

@@ -1,5 +1,8 @@
+# hydra_configs/configs.yaml
+
 defaults:
   - dataset: live_zmq
+  - experiment: live_zmq
   - _self_
 
 eval: false

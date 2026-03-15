@@ -1,0 +1,11 @@
+defaults:
+  - /dataset@_global_: tum_fr3
+  - /results@_global_: offline
+  - /training@_global_: mono_slam
+  - /opt@_global_: default
+  - /model@_global_: default
+  - /pipeline@_global_: default
+  - _self_
+
+experiment:
+  name: tum_fr3
