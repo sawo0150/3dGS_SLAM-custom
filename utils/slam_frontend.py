@@ -349,36 +349,52 @@ class FrontEnd(mp.Process):
 
         return window, removed_frame
 
+    # 💡 [리뷰 포인트 - 프로세스 간 통신 (요청)]:
+    # Frontend는 실시간 Tracking에 집중해야 하므로, 연산이 무거운 Mapping 작업이나 
+    # Keyframe 추가 작업은 Queue를 통해 Backend 프로세스로 넘깁니다.
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap):
+        # 새로운 키프레임 생성을 백엔드에 요청 (이미지, 카메라 포즈, 현재 윈도우, 초기 뎁스 전달)
         msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap]
         self.backend_queue.put(msg)
         self.requested_keyframe += 1
 
     def reqeust_mapping(self, cur_frame_idx, viewpoint):
+        # 현재 프레임에 대한 매핑(최적화) 요청
         msg = ["map", cur_frame_idx, viewpoint]
         self.backend_queue.put(msg)
 
     def request_init(self, cur_frame_idx, viewpoint, depth_map):
+        # 시스템의 첫 프레임 초기화 요청
         msg = ["init", cur_frame_idx, viewpoint, depth_map]
         self.backend_queue.put(msg)
         self.requested_init = True
 
+    # 💡 [리뷰 포인트 - 프로세스 간 통신 (동기화)]:
+    # Backend에서 최적화(Mapping)가 끝난 최신 가우시안 맵과 보정된 카메라 포즈를 
+    # Frontend로 가져와(Sync) 다음 Tracking이 더 정확해지도록 업데이트합니다.
     def sync_backend(self, data):
-        self.gaussians = data[1]
-        occ_aware_visibility = data[2]
-        keyframes = data[3]
+        self.gaussians = data[1]            # 백엔드에서 최적화된 최신 3D 가우시안 맵
+        occ_aware_visibility = data[2]      # 프레임별 가시성(Visibility) 정보 업데이트
+        keyframes = data[3]                 # 백엔드에서 보정된 키프레임 포즈(R, T)들
         self.occ_aware_visibility = occ_aware_visibility
 
         for kf_id, kf_R, kf_T in keyframes:
+            # 백엔드에서 Bundle Adjustment 등으로 최적화된 카메라 위치로 Frontend 카메라 갱신
             self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
 
+    # 💡 [리뷰 포인트 - 메모리 관리]:
+    # 처리 완료된 프레임 이미지나 텐서들을 정리하여 GPU VRAM이 터지지(OOM) 않도록 방지합니다.
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
         if cur_frame_idx % 10 == 0:
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()# 10프레임마다 강제로 캐시를 비워 메모리 단편화 해소
 
+    # 💡 [리뷰 포인트 - 프론트엔드 메인 파이프라인]:
+    # FrontEnd 프로세스가 시작되면 실행되는 무한 루프입니다.
+    # [데이터 로드 -> 트래킹(카메라 위치 찾기) -> 키프레임 판별 -> 백엔드와 동기화] 의 사이클을 돕니다.
     def run(self):
         cur_frame_idx = 0
+        # 카메라 내부 파라미터(Intrinsics)를 바탕으로 투영 매트릭스 생성
         projection_matrix = getProjectionMatrix2(
             znear=0.01,
             zfar=100.0,
@@ -390,10 +406,13 @@ class FrontEnd(mp.Process):
             H=self.dataset.height,
         ).transpose(0, 1)
         projection_matrix = projection_matrix.to(device=self.device)
+
+        # 타이밍 측정을 위한 CUDA Event 객체
         tic = torch.cuda.Event(enable_timing=True)
         toc = torch.cuda.Event(enable_timing=True)
 
         while True:
+            # 1. GUI 컨트롤 처리 (일시정지/재개)
             if self.q_vis2main.empty():
                 if self.pause:
                     continue
@@ -406,8 +425,10 @@ class FrontEnd(mp.Process):
                 else:
                     self.backend_queue.put(["unpause"])
 
+            # 2. 메인 Tracking 루프 (Backend에서 온 메시지가 없을 때 진행)
             if self.frontend_queue.empty():
                 tic.record()
+                # 데이터셋을 끝까지 다 돌았을 경우: 최종 평가(ATE) 및 맵 저장 후 종료
                 if cur_frame_idx >= len(self.dataset):
                     if self.save_results:
                         eval_ate(
@@ -422,7 +443,7 @@ class FrontEnd(mp.Process):
                             self.gaussians, self.save_dir, "final", final=True
                         )
                     break
-
+                # Backend가 초기화 중이거나, 싱글스레드 모드에서 키프레임 처리 중이면 대기 (병목 현상 방지)
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
@@ -434,7 +455,8 @@ class FrontEnd(mp.Process):
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
-
+                
+                # 3. 새로운 프레임 데이터 로드
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix
                 )
@@ -442,23 +464,27 @@ class FrontEnd(mp.Process):
 
                 self.cameras[cur_frame_idx] = viewpoint
 
+                # 4. 초기화 모드일 경우 (시스템 첫 시작 혹은 Tracking 실패로 인한 Reset)
                 if self.reset:
                     self.initialize(cur_frame_idx, viewpoint)
                     self.current_window.append(cur_frame_idx)
                     cur_frame_idx += 1
                     continue
-
+                
+                # 슬라이딩 윈도우가 다 차면 초기화 완료로 간주
                 self.initialized = self.initialized or (
                     len(self.current_window) == self.window_size
                 )
 
                 # Tracking
+                # 5. 현재 프레임 Tracking 수행 (가장 중요한 부분)
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
                 keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
 
+                # 6. GUI 업데이트: 트래킹이 완료된 현재 뷰와 키프레임 윈도우 정보를 시각화 툴로 전송
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         gaussians=clone_obj(self.gaussians),
@@ -467,21 +493,26 @@ class FrontEnd(mp.Process):
                         kf_window=current_window_dict,
                     )
                 )
-
+                
+                # Backend에 넘겨놓은 키프레임 작업이 밀려있으면 일단 대기
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
                     continue
-
+                
+                # 7. 키프레임 등록 여부 판단 로직
                 last_keyframe_idx = self.current_window[0]
                 check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
+
+                # 이동 거리와 시야 겹침 정도를 계산하여 새 키프레임이 필요한지 결정
                 create_kf = self.is_keyframe(
                     cur_frame_idx,
                     last_keyframe_idx,
                     curr_visibility,
                     self.occ_aware_visibility,
                 )
+                # 윈도우가 아직 안 찼을 때는 강제성을 부여하여 키프레임을 좀 더 적극적으로 생성
                 if len(self.current_window) < self.window_size:
                     union = torch.logical_or(
                         curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
@@ -496,19 +527,24 @@ class FrontEnd(mp.Process):
                     )
                 if self.single_thread:
                     create_kf = check_time and create_kf
+
+                # 8. 새 키프레임으로 채택된 경우의 처리
                 if create_kf:
+                    # 슬라이딩 윈도우에 추가 (필요 시 가장 안 중요한 프레임 제거)
                     self.current_window, removed = self.add_to_window(
                         cur_frame_idx,
                         curr_visibility,
                         self.occ_aware_visibility,
                         self.current_window,
                     )
+                    # 단안 카메라인데 오버랩이 너무 적어 윈도우에서 프레임이 제거되었다면 리셋 고려
                     if self.monocular and not self.initialized and removed is not None:
                         self.reset = True
                         Log(
                             "Keyframes lacks sufficient overlap to initialize the map, resetting."
                         )
                         continue
+                    # 새로운 키프레임 생성 및 백엔드에 매핑 요청
                     depth_map = self.add_new_keyframe(
                         cur_frame_idx,
                         depth=render_pkg["depth"],
@@ -519,6 +555,7 @@ class FrontEnd(mp.Process):
                         cur_frame_idx, viewpoint, self.current_window, depth_map
                     )
                 else:
+                    # 키프레임이 아닌 일반 프레임은 Tracking 후 메모리에서 해제
                     self.cleanup(cur_frame_idx)
                 cur_frame_idx += 1
 
@@ -538,23 +575,31 @@ class FrontEnd(mp.Process):
                     )
                 toc.record()
                 torch.cuda.synchronize()
+
+                # 키프레임 추가 시 시스템 과부하를 막기 위해 일시적인 속도 조절(스로틀링) 적용 (3fps 제한)
                 if create_kf:
                     # throttle at 3fps when keyframe is added
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
+
+            # 9. Backend에서 보낸 데이터(메시지)가 큐에 있을 경우 수신하여 처리
             else:
                 data = self.frontend_queue.get()
                 if data[0] == "sync_backend":
+                    # 일반 동기화 요청
                     self.sync_backend(data)
 
                 elif data[0] == "keyframe":
+                    # 키프레임 처리가 완료되어 백엔드에서 맵/포즈 갱신 데이터 전송됨
                     self.sync_backend(data)
-                    self.requested_keyframe -= 1
+                    self.requested_keyframe -= 1        # 대기 중인 키프레임 수 감소
 
                 elif data[0] == "init":
+                    # 초기화 완료 데이터 전송됨
                     self.sync_backend(data)
                     self.requested_init = False
 
                 elif data[0] == "stop":
+                    # 시스템 종료 메시지
                     Log("Frontend Stopped.")
                     break
